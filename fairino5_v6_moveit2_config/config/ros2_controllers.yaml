@@ -1,14 +1,27 @@
 # This config file is used by ros2_control
 controller_manager:
   ros__parameters:
-    update_rate: 100  # Hz
+    update_rate: 500  # Hz (increased for smoother servo control)
 
     fairino5_controller:
       type: joint_trajectory_controller/JointTrajectoryController
 
-
     joint_state_broadcaster:
       type: joint_state_broadcaster/JointStateBroadcaster
+
+    forward_position_controller:
+      type: forward_command_controller/ForwardCommandController
+
+# 関節順序を明示的に指定（デフォルトだとj3とj4/j5が入れ替わる問題あり）
+joint_state_broadcaster:
+  ros__parameters:
+    joints:
+      - j1
+      - j2
+      - j3
+      - j4
+      - j5
+      - j6
 
 fairino5_controller:
   ros__parameters:
@@ -23,3 +36,14 @@ fairino5_controller:
       - position
     state_interfaces:
       - position
+
+forward_position_controller:
+  ros__parameters:
+    joints:
+      - j1
+      - j2
+      - j3
+      - j4
+      - j5
+      - j6
+    interface_name: position
