@@ -97,11 +97,12 @@ std::vector<hardware_interface::StateInterface> FairinoHardwareInterface::export
     state_interfaces.emplace_back(hardware_interface::StateInterface(
         info_.joints[i].name, hardware_interface::HW_IF_POSITION, &_jnt_position_state[i]));
 
+    // velocityはread()で取得処理が未実装のため当面disable
     // state_interfaces.emplace_back(hardware_interface::StateInterface(
     //     info_.joints[i].name, hardware_interface::HW_IF_VELOCITY, &_jnt_velocity_state.at(i)));
 
-    // state_interfaces.emplace_back(hardware_interface::StateInterface(
-    //     info_.joints[i].name, hardware_interface::HW_IF_EFFORT, &_jnt_torque_state.at(i)));
+    state_interfaces.emplace_back(hardware_interface::StateInterface(
+        info_.joints[i].name, hardware_interface::HW_IF_EFFORT, &_jnt_torque_state[i]));
   }
 
   //导出
@@ -231,7 +232,16 @@ hardware_interface::return_type FairinoHardwareInterface::read(const rclcpp::Tim
         for(int i=0;i<6;i++){
             int api = _joint_map[i];  // info_.joints[i] に対応するロボットAPIインデックス
             _jnt_position_state[i] = state_data.jPos[api]/180.0*M_PI;//注意单位转换，moveit统一用弧度
-            //_jnt_torque_state[i] = state_data.jt_cur_tor[api];//注意单位转换
+        }
+    }else{
+        hardware_interface::return_type::ERROR;
+    }
+    // 電流ベース推定トルク取得 (JointPosにはトルクメンバが無いので別API)
+    float torques[6];
+    if(_ptr_robot->GetJointTorques(0, torques) == 0){
+        for(int i=0;i<6;i++){
+            int api = _joint_map[i];
+            _jnt_torque_state[i] = torques[api];
         }
     }else{
         hardware_interface::return_type::ERROR;
