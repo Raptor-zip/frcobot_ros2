@@ -32,9 +32,9 @@ hardware_interface::CallbackReturn FairinoHardwareInterface::on_init(const hardw
         //     return hardware_interface::CallbackReturn::ERROR;
         // }
 
-        //关节状态部分
-        if (joint.state_interfaces.size() != 1) {
-            RCLCPP_FATAL(rclcpp::get_logger("FairinoHardwareInterface"), "Joint '%s' has %zu state interface. 3 expected.",
+        //关节状态部分: position + effort の2つを期待 (export_state_interfaces と一致)
+        if (joint.state_interfaces.size() != 2) {
+            RCLCPP_FATAL(rclcpp::get_logger("FairinoHardwareInterface"), "Joint '%s' has %zu state interface. 2 expected (position, effort).",
                         joint.name.c_str(), joint.state_interfaces.size());
             return hardware_interface::CallbackReturn::ERROR;
         }
@@ -46,19 +46,12 @@ hardware_interface::CallbackReturn FairinoHardwareInterface::on_init(const hardw
             return hardware_interface::CallbackReturn::ERROR;
         }
 
-        // if (joint.state_interfaces[1].name != hardware_interface::HW_IF_VELOCITY) {
-        //     RCLCPP_FATAL(rclcpp::get_logger("FairinoHardwareInterface"),
-        //                 "Joint '%s' have %s state interface as second state interface. '%s' expected.", joint.name.c_str(),
-        //                 joint.state_interfaces[1].name.c_str(), hardware_interface::HW_IF_VELOCITY);
-        //     return hardware_interface::CallbackReturn::ERROR;
-        // }
-
-        // if (joint.state_interfaces[2].name != hardware_interface::HW_IF_EFFORT) {
-        //     RCLCPP_FATAL(rclcpp::get_logger("FairinoHardwareInterface"),
-        //                 "Joint '%s' have %s state interface as third state interface. '%s' expected.", joint.name.c_str(),
-        //                 joint.state_interfaces[2].name.c_str(), hardware_interface::HW_IF_EFFORT);
-        //     return hardware_interface::CallbackReturn::ERROR;
-        // }
+        if (joint.state_interfaces[1].name != hardware_interface::HW_IF_EFFORT) {
+            RCLCPP_FATAL(rclcpp::get_logger("FairinoHardwareInterface"),
+                        "Joint '%s' have %s state interface as second state interface. '%s' expected.", joint.name.c_str(),
+                        joint.state_interfaces[1].name.c_str(), hardware_interface::HW_IF_EFFORT);
+            return hardware_interface::CallbackReturn::ERROR;
+        }
 
     }
 
