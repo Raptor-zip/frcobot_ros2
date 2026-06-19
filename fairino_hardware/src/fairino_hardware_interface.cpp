@@ -1,5 +1,8 @@
 #include "fairino_hardware/fairino_hardware_interface.hpp"
 
+#include <sstream>
+#include <vector>
+
 namespace fairino_hardware{
 
 hardware_interface::CallbackReturn FairinoHardwareInterface::on_init(const hardware_interface::HardwareInfo& sysinfo){
@@ -197,6 +200,19 @@ hardware_interface::CallbackReturn FairinoHardwareInterface::on_activate(const r
         }
         _servo_running = true;
         _servo_thread = std::thread(&FairinoHardwareInterface::_servo_loop, this);
+
+        // DO/IO制御サービスを起動(既存のRPC接続を共有してSetDOを実行)
+        _cmd_node = std::make_shared<rclcpp::Node>("fairino_hw_command_server");
+        _cmd_service = _cmd_node->create_service<fairino_msgs::srv::RemoteCmdInterface>(
+            "fairino_remote_command_service",
+            std::bind(&FairinoHardwareInterface::_handle_remote_command, this,
+                      std::placeholders::_1, std::placeholders::_2));
+        _cmd_executor = std::make_shared<rclcpp::executors::SingleThreadedExecutor>();
+        _cmd_executor->add_node(_cmd_node);
+        _cmd_spin_thread = std::thread([this]{ _cmd_executor->spin(); });
+        RCLCPP_INFO(rclcpp::get_logger("FairinoHardwareInterface"),
+            "DO制御サービス起動: /fairino_remote_command_service (SetDO/SetToolDO対応)");
+
         RCLCPP_INFO(rclcpp::get_logger("FairinoHardwareInterface"), "机械臂硬件启动成功!");
         return hardware_interface::CallbackReturn::SUCCESS;
     }else{
@@ -210,6 +226,14 @@ hardware_interface::CallbackReturn FairinoHardwareInterface::on_activate(const r
 hardware_interface::CallbackReturn FairinoHardwareInterface::on_deactivate(const rclcpp_lifecycle::State& previous_state)
 {
     RCLCPP_INFO(rclcpp::get_logger("FairinoHardwareInterface"), "Stopping ...please wait...");
+    // DO制御サービスを先に停止
+    if(_cmd_executor) _cmd_executor->cancel();
+    if(_cmd_spin_thread.joinable()) _cmd_spin_thread.join();
+    if(_cmd_executor && _cmd_node) _cmd_executor->remove_node(_cmd_node);
+    _cmd_service.reset();
+    _cmd_node.reset();
+    _cmd_executor.reset();
+
     // まずバックグラウンドスレッドを停止してからロボットAPIを呼ぶ
     _servo_running = false;
     if(_servo_thread.joinable()) _servo_thread.join();
@@ -226,7 +250,11 @@ hardware_interface::CallbackReturn FairinoHardwareInterface::on_deactivate(const
 hardware_interface::return_type FairinoHardwareInterface::read(const rclcpp::Time& time,const rclcpp::Duration& period)
 {//从RTDE反馈数据中获取所需的位置，速度和扭矩信息
     JointPos state_data;
-    error_t returncode = _ptr_robot->GetActualJointPosDegree(1,&state_data);
+    error_t returncode;
+    {
+        std::lock_guard<std::mutex> rpc_lock(_rpc_mutex);
+        returncode = _ptr_robot->GetActualJointPosDegree(1,&state_data);
+    }
     if(returncode == 0){
         for(int i=0;i<6;i++){
             int api = _joint_map[i];  // info_.joints[i] に対応するロボットAPIインデックス
@@ -306,7 +334,11 @@ void FairinoHardwareInterface::_servo_loop()
         }
 
         auto t0 = std::chrono::steady_clock::now();
-        int ret = _ptr_robot->ServoJ(&cmd, &extcmd, 0, 0, CMDT, 0, 0);
+        int ret;
+        {
+            std::lock_guard<std::mutex> rpc_lock(_rpc_mutex);
+            ret = _ptr_robot->ServoJ(&cmd, &extcmd, 0, 0, CMDT, 0, 0);
+        }
         auto t1 = std::chrono::steady_clock::now();
 
         double call_ms = std::chrono::duration<double,std::milli>(t1 - t0).count();
@@ -329,16 +361,82 @@ void FairinoHardwareInterface::_servo_loop()
                 "[ServoThread] 呼び出し=%d, ServoJ平均=%.2fms, エラー=%d",
                 call_count, total_call_ms/call_count, error_count);
             ROBOT_STATE_PKG pkg;
-            if(_ptr_robot->GetRobotRealTimeState(&pkg) == 0){
+            int st_ret;
+            {
+                std::lock_guard<std::mutex> rpc_lock(_rpc_mutex);
+                st_ret = _ptr_robot->GetRobotRealTimeState(&pkg);
+            }
+            if(st_ret == 0){
                 RCLCPP_INFO(rclcpp::get_logger("FairinoHardwareInterface"),
-                    "[ServoThread] robot_state=%d(1=停止,2=運動), mc_queue_len=%d",
-                    pkg.robot_state, pkg.mc_queue_len);
+                    "[ServoThread] robot_state=%d(1=停止,2=運動), mc_queue_len=%d, main_code=%d, sub_code=%d",
+                    pkg.robot_state, pkg.mc_queue_len, pkg.main_code, pkg.sub_code);
             }
         }
     }
     RCLCPP_INFO(rclcpp::get_logger("FairinoHardwareInterface"),
         "[ServoThread] 終了: 総呼び出し=%d, 平均=%.2fms, エラー=%d",
         call_count, call_count > 0 ? total_call_ms/call_count : 0.0, error_count);
+}
+
+void FairinoHardwareInterface::_handle_remote_command(
+    const std::shared_ptr<fairino_msgs::srv::RemoteCmdInterface::Request> req,
+    std::shared_ptr<fairino_msgs::srv::RemoteCmdInterface::Response> res)
+{
+    // cmd_str 例: "SetDO(0,1)" / "SetToolDO(0,1)"
+    // func(arg0,arg1,...) を分解する
+    const std::string& cmd = req->cmd_str;
+    auto lpar = cmd.find('(');
+    auto rpar = cmd.rfind(')');
+    if(lpar == std::string::npos || rpar == std::string::npos || rpar <= lpar){
+        res->cmd_res = "-1";
+        RCLCPP_ERROR(rclcpp::get_logger("FairinoHardwareInterface"),
+            "[DOサービス] 不正なコマンド形式: %s", cmd.c_str());
+        return;
+    }
+    const std::string func = cmd.substr(0, lpar);
+    const std::string argstr = cmd.substr(lpar + 1, rpar - lpar - 1);
+
+    std::vector<int> args;
+    std::stringstream ss(argstr);
+    std::string item;
+    try {
+        while(std::getline(ss, item, ',')){
+            if(item.empty()) continue;
+            args.push_back(std::stoi(item));
+        }
+    } catch(const std::exception& e){
+        res->cmd_res = "-1";
+        RCLCPP_ERROR(rclcpp::get_logger("FairinoHardwareInterface"),
+            "[DOサービス] 引数解析失敗: %s", cmd.c_str());
+        return;
+    }
+
+    if((func == "SetDO" || func == "SetToolDO") && args.size() >= 2){
+        const int id = args[0];
+        const uint8_t status = (args[1] != 0) ? 1 : 0;
+        // smooth/block はデフォルト(平滑なし/非阻塞)。3,4番目があれば使用。
+        const uint8_t smooth = (args.size() >= 3) ? static_cast<uint8_t>(args[2]) : 0;
+        const uint8_t block  = (args.size() >= 4) ? static_cast<uint8_t>(args[3]) : 1;
+
+        errno_t ret;
+        {
+            std::lock_guard<std::mutex> rpc_lock(_rpc_mutex);
+            if(func == "SetDO"){
+                ret = _ptr_robot->SetDO(id, status, smooth, block);
+            }else{
+                ret = _ptr_robot->SetToolDO(id, status, smooth, block);
+            }
+        }
+        // 公式command_serverと同様、ロボットの実エラーコードをそのまま返す(0=成功)
+        res->cmd_res = std::to_string(ret);
+        RCLCPP_INFO(rclcpp::get_logger("FairinoHardwareInterface"),
+            "[DOサービス] %s(id=%d, status=%d) → ret=%d", func.c_str(), id, status, ret);
+        return;
+    }
+
+    res->cmd_res = "-1";
+    RCLCPP_ERROR(rclcpp::get_logger("FairinoHardwareInterface"),
+        "[DOサービス] 未対応コマンド(SetDO/SetToolDOのみ対応): %s", cmd.c_str());
 }
 
 

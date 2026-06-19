@@ -14,6 +14,7 @@
 #include <mutex>
 #include <atomic>
 #include "libfairino/include/robot.h"
+#include "fairino_msgs/srv/remote_cmd_interface.hpp"
 
 
 #define CONTROLLER_IP_ADDRESS "192.168.58.2"
@@ -84,6 +85,22 @@ private:
   // ros2_control の ResourceManager が info_.joints を URDF と異なる順序で返す場合がある
   // (例: j1,j2,j4,j5,j3,j6)。ロボットAPI の jPos[] は常に j1-j6 順なので変換が必要。
   int _joint_map[6];
+
+  // --- DO/IO制御サービス ---
+  // Fairinoコントローラは同時に1つのRPC接続しか受け付けないため、MoveIt実機制御中は
+  // 別プロセス(ros2_cmd_server)からSetDOを呼べない。そこでハードウェアIFが既に保持している
+  // RPC接続を共有し、デジタル出力(電磁弁・グリッパ等)を制御するサービスを提供する。
+  // サービス名/型は公式 ros2_cmd_server と同一(fairino_remote_command_service /
+  // fairino_msgs/srv/RemoteCmdInterface)とし、cmd_str="SetDO(id,status)" 等を受け付ける。
+  void _handle_remote_command(
+      const std::shared_ptr<fairino_msgs::srv::RemoteCmdInterface::Request> req,
+      std::shared_ptr<fairino_msgs::srv::RemoteCmdInterface::Response> res);
+
+  rclcpp::Node::SharedPtr _cmd_node;
+  rclcpp::Service<fairino_msgs::srv::RemoteCmdInterface>::SharedPtr _cmd_service;
+  std::shared_ptr<rclcpp::executors::SingleThreadedExecutor> _cmd_executor;
+  std::thread _cmd_spin_thread;
+  std::mutex  _rpc_mutex;  // _ptr_robot へのRPC呼び出しを直列化(ServoJ/read/SetDOの競合防止)
 };
 
 } //end namespace
