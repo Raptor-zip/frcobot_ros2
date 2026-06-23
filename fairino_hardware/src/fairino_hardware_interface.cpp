@@ -165,15 +165,20 @@ hardware_interface::CallbackReturn FairinoHardwareInterface::on_activate(const r
         }
         RCLCPP_INFO(rclcpp::get_logger("FairinoHardwareInterface"),"初始指令位置: %f,%f,%f,%f,%f,%f",_jnt_position_command[0],\
         _jnt_position_command[1],_jnt_position_command[2],_jnt_position_command[3],_jnt_position_command[4],_jnt_position_command[5]);
-        // ロボット初期化シーケンス: エラーリセット → 自動モード → 使能 → ServoMoveStart
+        // ロボット初期化シーケンス: エラーリセット → ドラッグ解除 → 自動モード → 使能 → ServoMoveStart
         _ptr_robot->ResetAllError();
+        rclcpp::sleep_for(500ms);
+        // 前回のフリー化(DragTeachSwitch(1))でドラッグ示教モード(robot_state=4)のまま終了した場合、
+        // そのモードは再起動しても残り、ServoJが全てret=14で失敗する。起動時に必ず解除する。
+        // (手動モードのまま解除→その後Mode(0)で自動へ、という_exitDragModeと同じ順序)
+        _ptr_robot->DragTeachSwitch(0);
         rclcpp::sleep_for(500ms);
         _ptr_robot->Mode(0);
         rclcpp::sleep_for(500ms);
         _ptr_robot->RobotEnable(1);
         rclcpp::sleep_for(500ms);
         RCLCPP_INFO(rclcpp::get_logger("FairinoHardwareInterface"),
-            "ロボット初期化完了(ResetAllError→Mode(0)→RobotEnable(1))");
+            "ロボット初期化完了(ResetAllError→DragTeachSwitch(0)→Mode(0)→RobotEnable(1))");
 
         // ServoMoveStart をリトライ付きで実行
         errno_t servo_ret = -1;
@@ -186,8 +191,10 @@ hardware_interface::CallbackReturn FairinoHardwareInterface::on_activate(const r
             }
             RCLCPP_WARN(rclcpp::get_logger("FairinoHardwareInterface"),
                 "ServoMoveStart失敗(エラーコード:%d, 試行%d/3)", servo_ret, attempt + 1);
-            // リトライ前にエラーリセットと再初期化
+            // リトライ前にエラーリセットと再初期化(ドラッグ解除も含める)
             _ptr_robot->ResetAllError();
+            rclcpp::sleep_for(500ms);
+            _ptr_robot->DragTeachSwitch(0);
             rclcpp::sleep_for(500ms);
             _ptr_robot->Mode(0);
             rclcpp::sleep_for(500ms);
@@ -273,6 +280,10 @@ hardware_interface::return_type FairinoHardwareInterface::read(const rclcpp::Tim
 
 hardware_interface::return_type FairinoHardwareInterface::write(const rclcpp::Time& time,const rclcpp::Duration& period)
 {
+    // ドラッグモード中はコントローラ指令を共有変数に反映しない(手動移動を妨げない)
+    if(_servo_paused.load()){
+        return hardware_interface::return_type::OK;
+    }
     if(_control_mode == 0){//位置控制模式
         if (std::any_of(&_jnt_position_command[0], &_jnt_position_command[5],\
             [](double c) { return not std::isfinite(c); })) {
@@ -317,20 +328,89 @@ void FairinoHardwareInterface::_servo_loop()
     ExaxisPos extcmd{0,0,0,0};
     int call_count = 0, error_count = 0;
     double total_call_ms = 0.0;
+    // 直近のServoJ戻り値とその発生回数の内訳(診断用)。
+    // 14=ERR_EXECUTION_FAILED, 28=IK計算失敗, 29=ERR_SERVOJ_JOINT_OVERRUN(関節値超限/速度オーバー)
+    int last_servoj_ret = 0;
+    int last_err_call = -1;
+    // 指令ステップ量(Δ)診断: 前回送信した指令と送信時刻を保持し、
+    // 1ServoJあたりの最大関節変化量[deg]と実効角速度[deg/s]を計算する。
+    // 指令不連続(オーバーラン由来のジャンプ)が ret=14 の引き金かを直接確認するため。
+    JointPos prev_cmd;
+    bool have_prev = false;
+    auto prev_send_time = std::chrono::steady_clock::now();
+    double max_step_deg = 0.0;   // 直近100回での最大Δ[deg]
 
     // 目標送信間隔 = cmdT にすることで fill_rate = drain_rate → キュー安定
     // ServoJ が ~5ms かかるため、残り時間をスリープで補完して合計を TARGET_MS にする。
     // TARGET_MS と CMDT は一致させる → fill_rate = drain_rate → mc_queue_len ≈ 0
     const double TARGET_MS = 10.0;
     const float  CMDT      = 0.010f;
+    // 実行時の速度クランプ(スルーレート制限):
+    // 1ServoJ送信あたりの関節変化量[deg]の上限。これを超えるΔはこの値にクランプし、
+    // 関節空間速度オーバーラン(コントローラ実効上限~170deg/sより下)を物理的に防ぐ。
+    // 1.5deg / cmdT(10ms) ≒ 150deg/s。軌道の継ぎ目ジャンプ(back-to-back)もここで抑える。
+    // 注意: 軌道がこれを超える区間ではロボットが軌道に少し遅れる(指令終了後に追従)。
+    //       本来は joint_limits/velocity_scale を下げてクランプがほぼ発火しない運用が理想。
+    const double MAX_STEP_DEG = 1.5;
 
     while(_servo_running){
+        // ドラッグモード移行中はServoJ送信を止める(モード切替・ドラッグと競合させない)
+        if(_servo_paused.load()){
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            continue;
+        }
+
         auto loop_start = std::chrono::steady_clock::now();
 
         JointPos cmd;
         {
             std::lock_guard<std::mutex> lock(_cmd_mutex);
             for(int j=0;j<6;j++) cmd.jPos[j] = _shared_cmd_deg[j];
+        }
+
+        // 指令ステップ量Δを計算(前回送信指令との差・送信間隔)
+        double step_deg = 0.0;     // 今回の最大関節Δ[deg]
+        int    step_jnt = -1;      // Δ最大の関節
+        double interval_ms = std::chrono::duration<double,std::milli>(
+            std::chrono::steady_clock::now() - prev_send_time).count();
+        if(have_prev){
+            for(int j=0;j<6;j++){
+                double d = std::abs(cmd.jPos[j] - prev_cmd.jPos[j]);
+                if(d > step_deg){ step_deg = d; step_jnt = j; }
+            }
+            if(step_deg > max_step_deg) max_step_deg = step_deg;
+        }
+        // 実効角速度[deg/s] = Δ / 送信間隔。CMDT(=10ms)で割った値が「コントローラに要求した速度」。
+        double impl_vel_dps  = (interval_ms > 0.01) ? step_deg / (interval_ms/1000.0) : 0.0;
+        double cmdt_vel_dps  = step_deg / CMDT;  // cmdT基準の要求速度(コントローラが見る値)
+
+        // 指令ジャンプ即時検出: Δが閾値(=1.6deg/送信≒160deg/s)を超えた瞬間を、
+        // ServoJの成否に関係なくログする。軌道の継ぎ目(back-to-back)で指令が
+        // 不連続にジャンプしていないかを直接捕捉するため。
+        if(have_prev && step_deg > 1.6){
+            RCLCPP_WARN(rclcpp::get_logger("FairinoHardwareInterface"),
+                "[ServoThread] 指令ジャンプ検出 Δ=%.4fdeg(j%d) 送信間隔=%.1fms 実効速度=%.1fdeg/s cmdT基準=%.1fdeg/s call=%d",
+                step_deg, step_jnt+1, interval_ms, impl_vel_dps, cmdt_vel_dps, call_count+1);
+        }
+
+        // 実行時クランプ: 各関節のΔを MAX_STEP_DEG に制限してから送信する。
+        // これにより定常速度超過も継ぎ目ジャンプもコントローラの関節速度上限を超えない。
+        if(have_prev){
+            bool clamped = false;
+            double clamp_maxd = 0.0; int clamp_j = -1;
+            for(int j=0;j<6;j++){
+                double d = cmd.jPos[j] - prev_cmd.jPos[j];
+                if(std::abs(d) > MAX_STEP_DEG){
+                    cmd.jPos[j] = prev_cmd.jPos[j] + (d > 0 ? MAX_STEP_DEG : -MAX_STEP_DEG);
+                    clamped = true;
+                    if(std::abs(d) > clamp_maxd){ clamp_maxd = std::abs(d); clamp_j = j; }
+                }
+            }
+            if(clamped){
+                RCLCPP_WARN(rclcpp::get_logger("FairinoHardwareInterface"),
+                    "[ServoThread] 速度クランプ発火 元Δ=%.4fdeg(j%d)→%.2fdeg に制限 call=%d",
+                    clamp_maxd, clamp_j+1, MAX_STEP_DEG, call_count+1);
+            }
         }
 
         auto t0 = std::chrono::steady_clock::now();
@@ -341,10 +421,26 @@ void FairinoHardwareInterface::_servo_loop()
         }
         auto t1 = std::chrono::steady_clock::now();
 
+        prev_cmd = cmd;
+        prev_send_time = loop_start;
+        have_prev = true;
+
         double call_ms = std::chrono::duration<double,std::milli>(t1 - t0).count();
         call_count++;
         total_call_ms += call_ms;
-        if(ret != 0) error_count++;
+        if(ret != 0){
+            error_count++;
+            // 実際の戻り値＋発生時のステップ量Δを出す。
+            // Δが平常時より跳ねていれば「指令ジャンプ→実行失敗」が裏付けられる。
+            if(ret != last_servoj_ret || call_count - last_err_call > 100){
+                RCLCPP_WARN(rclcpp::get_logger("FairinoHardwareInterface"),
+                    "[ServoThread] ServoJエラー ret=%d (14=実行失敗,28=IK失敗,29=関節値超限) call=%d "
+                    "Δ=%.4fdeg(j%d) 送信間隔=%.1fms 実効速度=%.1fdeg/s cmdT基準=%.1fdeg/s",
+                    ret, call_count, step_deg, step_jnt+1, interval_ms, impl_vel_dps, cmdt_vel_dps);
+            }
+            last_servoj_ret = ret;
+            last_err_call = call_count;
+        }
 
         // ループ全体を TARGET_MS に合わせるためスリープ
         // → 送信間隔 ≈ cmdT なのでコントローラがタイムアウトせず、かつキューも膨らまない
@@ -358,8 +454,9 @@ void FairinoHardwareInterface::_servo_loop()
 
         if(call_count % 100 == 0){
             RCLCPP_INFO(rclcpp::get_logger("FairinoHardwareInterface"),
-                "[ServoThread] 呼び出し=%d, ServoJ平均=%.2fms, エラー=%d",
-                call_count, total_call_ms/call_count, error_count);
+                "[ServoThread] 呼び出し=%d, ServoJ平均=%.2fms, エラー=%d, 直近ret=%d, 最大Δ=%.4fdeg/送信",
+                call_count, total_call_ms/call_count, error_count, last_servoj_ret, max_step_deg);
+            max_step_deg = 0.0;  // 次の100回区間に向けてリセット
             ROBOT_STATE_PKG pkg;
             int st_ret;
             {
@@ -434,9 +531,86 @@ void FairinoHardwareInterface::_handle_remote_command(
         return;
     }
 
+    // 安全フリー化: DragTeachSwitch(1)=ドラッグ移行 / DragTeachSwitch(0)=自動復帰
+    if(func == "DragTeachSwitch" && args.size() >= 1){
+        res->cmd_res = (args[0] != 0) ? _enterDragMode() : _exitDragMode();
+        return;
+    }
+
     res->cmd_res = "-1";
     RCLCPP_ERROR(rclcpp::get_logger("FairinoHardwareInterface"),
-        "[DOサービス] 未対応コマンド(SetDO/SetToolDOのみ対応): %s", cmd.c_str());
+        "[DOサービス] 未対応コマンド(SetDO/SetToolDO/DragTeachSwitchのみ対応): %s", cmd.c_str());
+}
+
+// servoループを停止し、手動モード＋ドラッグ示教へ移行する(手でガイド可能・重力補償あり)。
+std::string FairinoHardwareInterface::_enterDragMode()
+{
+    using namespace std::chrono_literals;
+    if(_drag_active.load()){
+        RCLCPP_WARN(rclcpp::get_logger("FairinoHardwareInterface"), "[フリー化] 既にドラッグモードです");
+        return "0";
+    }
+    // 1) servoループのServoJ送信を停止し、進行中の呼び出しが終わるのを待つ
+    _servo_paused.store(true);
+    rclcpp::sleep_for(50ms);
+
+    // 重要: _rpc_mutex は各RPC呼び出しの「瞬間」だけ保持する。
+    // ロックを保持したまま sleep_for すると read() (100Hz制御ループ) が
+    // その間ブロックされ、制御周期を数百ms〜秒単位で食い潰す(オーバーラン)。
+    // 2) サーボ運動を終了
+    { std::lock_guard<std::mutex> rpc_lock(_rpc_mutex); _ptr_robot->ServoMoveEnd(); }
+    rclcpp::sleep_for(100ms);
+    // 3) 手動モードへ(ドラッグ示教は自動モードでは切替不可)
+    errno_t m;
+    { std::lock_guard<std::mutex> rpc_lock(_rpc_mutex); m = _ptr_robot->Mode(1); }
+    rclcpp::sleep_for(200ms);
+    // 4) ドラッグ示教ON
+    errno_t d;
+    { std::lock_guard<std::mutex> rpc_lock(_rpc_mutex); d = _ptr_robot->DragTeachSwitch(1); }
+    if(d == 0){
+        _drag_active.store(true);
+        RCLCPP_WARN(rclcpp::get_logger("FairinoHardwareInterface"),
+            "[フリー化] ドラッグモードに移行しました(手でガイド可能)。Mode(1) ret=%d", m);
+    }else{
+        RCLCPP_ERROR(rclcpp::get_logger("FairinoHardwareInterface"),
+            "[フリー化] DragTeachSwitch(1)失敗 ret=%d (Mode(1) ret=%d)。安全のためservo停止のまま", d, m);
+    }
+    return std::to_string(d);
+}
+
+// ドラッグ示教を解除し自動制御へ復帰する。指令位置を実位置へ同期するがコントローラ側の
+// 指令とズレるため、復帰直後にジャンプする可能性がある(最善努力。クリーンには再起動推奨)。
+std::string FairinoHardwareInterface::_exitDragMode()
+{
+    using namespace std::chrono_literals;
+    if(!_drag_active.load()){
+        return "0";
+    }
+    // _enterDragMode と同様、_rpc_mutex は各RPCの瞬間だけ保持し sleep はロック外で行う。
+    errno_t d;
+    { std::lock_guard<std::mutex> rpc_lock(_rpc_mutex); d = _ptr_robot->DragTeachSwitch(0); }
+    rclcpp::sleep_for(200ms);
+    { std::lock_guard<std::mutex> rpc_lock(_rpc_mutex); _ptr_robot->Mode(0); }
+    rclcpp::sleep_for(200ms);
+    { std::lock_guard<std::mutex> rpc_lock(_rpc_mutex); _ptr_robot->RobotEnable(1); }
+    rclcpp::sleep_for(200ms);
+    // 指令位置を現在実位置に同期(ジャンプ防止の最善努力)
+    JointPos jntpos;
+    errno_t pos_ret;
+    { std::lock_guard<std::mutex> rpc_lock(_rpc_mutex); pos_ret = _ptr_robot->GetActualJointPosDegree(0,&jntpos); }
+    if(pos_ret == 0){
+        std::lock_guard<std::mutex> lock(_cmd_mutex);
+        for(int j=0;j<6;j++){
+            int api = _joint_map[j];
+            _shared_cmd_deg[api] = jntpos.jPos[api];
+        }
+    }
+    { std::lock_guard<std::mutex> rpc_lock(_rpc_mutex); _ptr_robot->ServoMoveStart(); }
+    _drag_active.store(false);
+    _servo_paused.store(false);  // servoループ再開
+    RCLCPP_WARN(rclcpp::get_logger("FairinoHardwareInterface"),
+        "[フリー化] ドラッグモードを解除→自動制御へ復帰。コントローラ指令とのズレで動く可能性あり ret=%d", d);
+    return std::to_string(d);
 }
 
 

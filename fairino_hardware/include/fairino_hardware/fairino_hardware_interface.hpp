@@ -79,7 +79,14 @@ private:
   std::thread           _servo_thread;
   std::mutex            _cmd_mutex;
   std::atomic<bool>     _servo_running{false};
+  std::atomic<bool>     _servo_paused{false};  // ドラッグモード中はServoJ送信を一時停止
+  std::atomic<bool>     _drag_active{false};   // ドラッグ示教モード中フラグ
   double                _shared_cmd_deg[6];  // 単位: 度 (write→スレッド共有)
+
+  // 安全フリー化: servoループを止めて手動モード＋ドラッグ示教へ移行/復帰する。
+  // pose_action_server等が到達失敗時に DragTeachSwitch(1/0) で呼ぶ。
+  std::string _enterDragMode();
+  std::string _exitDragMode();
 
   // info_.joints のインデックス → ロボットAPI のインデックス(j1=0,...,j6=5)のマッピング
   // ros2_control の ResourceManager が info_.joints を URDF と異なる順序で返す場合がある
